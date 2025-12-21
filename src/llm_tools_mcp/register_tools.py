@@ -14,6 +14,51 @@ from llm_tools_mcp.cache import load_cached_tools, save_tools_cache
 
 
 # =============================================================================
+# Schema Sanitization for Gemini Compatibility
+# =============================================================================
+# Gemini's function calling API doesn't support all JSON Schema keywords.
+# We strip unsupported keywords to prevent "Unknown name" errors.
+
+UNSUPPORTED_SCHEMA_KEYWORDS = {
+    # Numeric constraints not supported by Gemini
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    # Schema composition keywords (partial support)
+    "$ref",
+    "$defs",
+    "definitions",
+    # Format/content keywords
+    "contentMediaType",
+    "contentEncoding",
+    # Deprecated keywords
+    "dependencies",
+}
+
+
+def _sanitize_schema(schema: dict | Any) -> dict | Any:
+    """Recursively remove unsupported JSON Schema keywords for Gemini compatibility."""
+    if not isinstance(schema, dict):
+        return schema
+
+    sanitized = {}
+    for key, value in schema.items():
+        if key in UNSUPPORTED_SCHEMA_KEYWORDS:
+            continue  # Skip unsupported keywords
+
+        if isinstance(value, dict):
+            sanitized[key] = _sanitize_schema(value)
+        elif isinstance(value, list):
+            sanitized[key] = [
+                _sanitize_schema(item) if isinstance(item, (dict, list)) else item
+                for item in value
+            ]
+        else:
+            sanitized[key] = value
+
+    return sanitized
+
+
+# =============================================================================
 # Persistent Event Loop Management
 # =============================================================================
 # Sessions are bound to event loops - we need a persistent loop for session reuse
@@ -81,7 +126,7 @@ def _create_tool_for_mcp(
     tool = llm.Tool(
         name=mcp_tool.name,
         description=enriched_description,
-        input_schema=mcp_tool.inputSchema,
+        input_schema=_sanitize_schema(mcp_tool.inputSchema),
         plugin="llm-tools-mcp",
         implementation=impl,
     )
@@ -150,7 +195,7 @@ def _rebuild_tools_from_cache(
         tool = llm.Tool(
             name=tool_name,
             description=description,
-            input_schema=item["schema"],
+            input_schema=_sanitize_schema(item["schema"]),
             plugin="llm-tools-mcp",
             implementation=impl,
         )
