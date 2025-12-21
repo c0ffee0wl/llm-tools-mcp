@@ -1,3 +1,4 @@
+from fnmatch import fnmatch
 from typing import Annotated
 from pydantic import BaseModel, Discriminator, Field, Tag
 from llm_tools_mcp.defaults import DEFAULT_CONFIG_DIR
@@ -48,14 +49,20 @@ class StdioServerConfig(BaseModel):
     command: str = Field()
     args: list[str] | None = Field(default=None)
     env: dict[str, str] | None = Field(default=None)
+    include_tools: list[str] | None = Field(default=None)
+    exclude_tools: list[str] | None = Field(default=None)
 
 
 class SseServerConfig(BaseModel):
     url: str = Field()
+    include_tools: list[str] | None = Field(default=None)
+    exclude_tools: list[str] | None = Field(default=None)
 
 
 class HttpServerConfig(BaseModel):
     url: str = Field()
+    include_tools: list[str] | None = Field(default=None)
+    exclude_tools: list[str] | None = Field(default=None)
 
 
 StdioOrSseServerConfig = Annotated[
@@ -97,3 +104,28 @@ class McpConfig:
 
     def get(self) -> McpConfigType:
         return self.config
+
+    def should_include_tool(self, server_name: str, tool_name: str) -> bool:
+        """Check if a tool should be included based on include/exclude patterns.
+
+        Supports glob-style patterns via fnmatch (*, ?, [seq]).
+
+        Logic:
+        - If include_tools is set: only include tools matching any pattern (whitelist)
+        - Elif exclude_tools is set: exclude tools matching any pattern (blacklist)
+        - Else: include all tools
+        """
+        server_config = self.config.mcpServers.get(server_name)
+        if not server_config:
+            return True
+
+        # Whitelist takes precedence - tool must match at least one pattern
+        if server_config.include_tools:
+            return any(fnmatch(tool_name, pattern) for pattern in server_config.include_tools)
+
+        # Blacklist - tool must NOT match any pattern
+        if server_config.exclude_tools:
+            return not any(fnmatch(tool_name, pattern) for pattern in server_config.exclude_tools)
+
+        # No filtering
+        return True

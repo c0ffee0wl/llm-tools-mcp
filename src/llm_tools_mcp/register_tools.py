@@ -26,11 +26,13 @@ def _create_tool_for_mcp(
     )
 
 
-def _get_tools_for_llm(mcp_client: McpClient) -> list[llm.Tool]:
+def _get_tools_for_llm(mcp_client: McpClient, mcp_config: McpConfig) -> list[llm.Tool]:
     tools = asyncio.run(mcp_client.get_all_tools())
     mapped_tools: list[llm.Tool] = []
     for server_name, server_tools in tools.items():
         for tool in server_tools:
+            if not mcp_config.should_include_tool(server_name, tool.name):
+                continue
             mapped_tools.append(_create_tool_for_mcp(server_name, mcp_client, tool))
     return mapped_tools
 
@@ -39,7 +41,7 @@ class MCP(llm.Toolbox):
     def __init__(self, config_path: str = DEFAULT_MCP_JSON_PATH):
         mcp_config = McpConfig.for_file_path(config_path)
         mcp_client = McpClient(mcp_config)
-        computed_tools = _get_tools_for_llm(mcp_client)
+        computed_tools = _get_tools_for_llm(mcp_client, mcp_config)
 
         for tool in computed_tools:
             self.add_tool(tool, pass_self=True)
