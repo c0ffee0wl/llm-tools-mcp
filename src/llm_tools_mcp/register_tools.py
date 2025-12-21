@@ -52,6 +52,13 @@ def _cleanup_loop():
             pass
     if _event_loop and not _event_loop.is_closed():
         try:
+            # Cancel any remaining pending tasks
+            pending = asyncio.all_tasks(_event_loop)
+            for task in pending:
+                task.cancel()
+            # Allow cancelled tasks to complete
+            if pending:
+                _event_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             _event_loop.close()
         except Exception:
             pass
@@ -62,7 +69,7 @@ def _cleanup_loop():
 # =============================================================================
 
 def _create_tool_for_mcp(
-    server_name: str, mcp_client: McpClient, mcp_tool: mcp.Tool
+    server_name: str, mcp_client: McpClient, mcp_config: McpConfig, mcp_tool: mcp.Tool
 ) -> llm.Tool:
     """Create an llm.Tool that calls the MCP server via persistent session."""
     def impl(**kwargs):
@@ -78,8 +85,9 @@ def _create_tool_for_mcp(
         plugin="llm-tools-mcp",
         implementation=impl,
     )
-    # Store server name for caching
+    # Store server name and optional status for filtering
     tool.server_name = server_name
+    tool.mcp_optional = mcp_config.is_optional(server_name)
     return tool
 
 
@@ -91,7 +99,7 @@ def _get_tools_for_llm(mcp_client: McpClient, mcp_config: McpConfig) -> list[llm
         for tool in server_tools:
             if not mcp_config.should_include_tool(server_name, tool.name):
                 continue
-            mapped_tools.append(_create_tool_for_mcp(server_name, mcp_client, tool))
+            mapped_tools.append(_create_tool_for_mcp(server_name, mcp_client, mcp_config, tool))
     return mapped_tools
 
 
@@ -147,6 +155,7 @@ def _rebuild_tools_from_cache(
             implementation=impl,
         )
         tool.server_name = server_name
+        tool.mcp_optional = mcp_config.is_optional(server_name)
         tools.append(tool)
 
     return tools

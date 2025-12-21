@@ -35,6 +35,7 @@ class McpClient:
         # Session persistence: cache sessions and transport contexts
         self._sessions: dict[str, ClientSession] = {}
         self._contexts: dict[str, object] = {}  # Transport context managers
+        self._http_sessions: dict[str, object] = {}  # HTTP session objects (need aclose)
         self._init_lock = threading.Lock()  # Thread-safe initialization
 
     async def _get_or_create_session(self, name: str) -> Optional[ClientSession]:
@@ -61,7 +62,8 @@ class McpClient:
             # Create transport and enter context (keep alive)
             if isinstance(server_config, HttpServerConfig):
                 ctx = streamablehttp_client(server_config.url)
-                read, write, _ = await ctx.__aenter__()
+                read, write, http_session = await ctx.__aenter__()
+                self._http_sessions[name] = http_session  # Store for proper cleanup
             elif isinstance(server_config, SseServerConfig):
                 ctx = sse_client(server_config.url)
                 read, write = await ctx.__aenter__()
@@ -192,17 +194,28 @@ class McpClient:
 
     async def close_all(self):
         """Properly cleanup all cached sessions and transports."""
-        # Close sessions first
-        for name, session in self._sessions.items():
+        # Close sessions first (copy to list to avoid dict modification during iteration)
+        for name, session in list(self._sessions.items()):
             try:
                 await session.__aexit__(None, None, None)
             except Exception:
                 pass
+
+        # Close HTTP session objects (have async iterators that need aclose)
+        for name, http_session in list(self._http_sessions.items()):
+            try:
+                if hasattr(http_session, 'aclose'):
+                    await http_session.aclose()
+            except Exception:
+                pass
+
         # Then close transport contexts
-        for name, ctx in self._contexts.items():
+        for name, ctx in list(self._contexts.items()):
             try:
                 await ctx.__aexit__(None, None, None)
             except Exception:
                 pass
+
         self._sessions.clear()
+        self._http_sessions.clear()
         self._contexts.clear()

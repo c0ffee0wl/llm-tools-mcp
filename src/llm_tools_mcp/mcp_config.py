@@ -51,18 +51,21 @@ class StdioServerConfig(BaseModel):
     env: dict[str, str] | None = Field(default=None)
     include_tools: list[str] | None = Field(default=None)
     exclude_tools: list[str] | None = Field(default=None)
+    optional: bool = Field(default=False)
 
 
 class SseServerConfig(BaseModel):
     url: str = Field()
     include_tools: list[str] | None = Field(default=None)
     exclude_tools: list[str] | None = Field(default=None)
+    optional: bool = Field(default=False)
 
 
 class HttpServerConfig(BaseModel):
     url: str = Field()
     include_tools: list[str] | None = Field(default=None)
     exclude_tools: list[str] | None = Field(default=None)
+    optional: bool = Field(default=False)
 
 
 StdioOrSseServerConfig = Annotated[
@@ -104,6 +107,11 @@ class McpConfig:
 
     def get(self) -> McpConfigType:
         return self.config
+
+    def is_optional(self, server_name: str) -> bool:
+        """Check if a server is marked as optional."""
+        server_config = self.config.mcpServers.get(server_name)
+        return getattr(server_config, 'optional', False) if server_config else False
 
     def should_include_tool(self, server_name: str, tool_name: str) -> bool:
         """Check if a tool should be included based on include/exclude patterns.
