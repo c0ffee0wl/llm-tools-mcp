@@ -136,16 +136,20 @@ def _create_tool_for_mcp(
     return tool
 
 
-def _get_tools_for_llm(mcp_client: McpClient, mcp_config: McpConfig) -> list[llm.Tool]:
-    """Fetch tools from all MCP servers and convert to llm.Tool objects."""
-    tools = _run_async(mcp_client.get_all_tools())
+def _get_tools_for_llm(mcp_client: McpClient, mcp_config: McpConfig) -> tuple[list[llm.Tool], bool]:
+    """Fetch tools from all MCP servers and convert to llm.Tool objects.
+
+    Returns:
+        Tuple of (tools_list, had_errors) where had_errors is True if any server failed.
+    """
+    tools, had_errors = _run_async(mcp_client.get_all_tools())
     mapped_tools: list[llm.Tool] = []
     for server_name, server_tools in tools.items():
         for tool in server_tools:
             if not mcp_config.should_include_tool(server_name, tool.name):
                 continue
             mapped_tools.append(_create_tool_for_mcp(server_name, mcp_client, mcp_config, tool))
-    return mapped_tools
+    return mapped_tools, had_errors
 
 
 # =============================================================================
@@ -240,9 +244,10 @@ class MCP(llm.Toolbox):
             computed_tools = _rebuild_tools_from_cache(cached, mcp_client, mcp_config)
         else:
             # Fetch schemas from servers (connects to each in parallel)
-            computed_tools = _get_tools_for_llm(mcp_client, mcp_config)
-            # Cache for next time
-            save_tools_cache(config_content, _serialize_tools(computed_tools))
+            computed_tools, had_errors = _get_tools_for_llm(mcp_client, mcp_config)
+            # Only cache if no errors - ensures failed servers are retried next time
+            if not had_errors:
+                save_tools_cache(config_content, _serialize_tools(computed_tools))
 
         for tool in computed_tools:
             self.add_tool(tool, pass_self=True)

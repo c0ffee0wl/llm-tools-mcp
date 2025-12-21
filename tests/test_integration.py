@@ -19,7 +19,7 @@ async def test_sse_deepwiki_mcp():
     mcp_config_obj = McpConfig.for_json_content(mcp_config_content)
     mcp_client = McpClient(mcp_config_obj)
 
-    tools = await mcp_client.get_all_tools()
+    tools, _ = await mcp_client.get_all_tools()
 
     assert "deepwiki" in tools, "Should have deepwiki server"
 
@@ -50,7 +50,7 @@ async def test_remote_fetch_mcp():
     mcp_config_obj = McpConfig.for_json_content(mcp_config_content)
     mcp_client = McpClient(mcp_config_obj)
 
-    tools = await mcp_client.get_all_tools()
+    tools, _ = await mcp_client.get_all_tools()
 
     assert "fetch" in tools, "Should have fetch server"
 

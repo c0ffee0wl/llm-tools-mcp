@@ -168,21 +168,31 @@ class McpClient:
                 return ListToolsResult(tools=[])
             return await session.list_tools()
 
-    async def get_all_tools(self) -> dict[str, list[Tool]]:
-        """Fetch tools from all servers in parallel."""
-        server_names = list(self.config.get().mcpServers.keys())
+    async def get_all_tools(self) -> tuple[dict[str, list[Tool]], bool]:
+        """Fetch tools from all servers in parallel.
 
-        async def fetch_tools(name: str) -> tuple[str, list[Tool]]:
+        Returns:
+            Tuple of (tools_dict, had_errors) where had_errors is True if any server failed.
+        """
+        server_names = list(self.config.get().mcpServers.keys())
+        had_errors = False
+
+        async def fetch_tools(name: str) -> tuple[str, list[Tool], bool]:
             try:
                 result = await self.get_tools_for(name)
-                return (name, result.tools)
+                return (name, result.tools, False)
             except Exception as e:
                 print(f"Warning: Failed to get tools from '{name}': {e}", file=sys.stderr)
-                return (name, [])
+                return (name, [], True)
 
         # Fetch all in parallel
         results = await asyncio.gather(*[fetch_tools(name) for name in server_names])
-        return dict(results)
+        tools_dict = {}
+        for name, tools, error in results:
+            tools_dict[name] = tools
+            if error:
+                had_errors = True
+        return tools_dict, had_errors
 
     async def call_tool(self, server_name: str, name: str, /, **kwargs):
         """Call tool using cached persistent session."""

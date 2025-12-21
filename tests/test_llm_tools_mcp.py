@@ -69,7 +69,7 @@ async def test_sse():
         mcp_config_obj = McpConfig.for_json_content(mcp_config_content)
         mcp_client = McpClient(mcp_config_obj)
 
-        server_to_tools = await mcp_client.get_all_tools()
+        server_to_tools, _ = await mcp_client.get_all_tools()
 
         assert "test_sse_server" in server_to_tools
         assert "long_task" in tool_names(server_to_tools)
@@ -113,7 +113,7 @@ async def test_stdio():
         mcp_config_obj = McpConfig.for_json_content(mcp_config_content)
         mcp_client = McpClient(mcp_config_obj)
 
-        server_to_tools = await mcp_client.get_all_tools()
+        server_to_tools, _ = await mcp_client.get_all_tools()
 
         assert "filesystem" in server_to_tools, "Should have filesystem server"
 
@@ -161,7 +161,7 @@ async def test_http():
         mcp_config_obj = McpConfig.for_json_content(mcp_config_content)
         mcp_client = McpClient(mcp_config_obj)
 
-        server_to_tools = await mcp_client.get_all_tools()
+        server_to_tools, _ = await mcp_client.get_all_tools()
 
         assert "test_http_server" in server_to_tools, "Should have test_http_server"
         assert "long_task_http" in tool_names(server_to_tools)
