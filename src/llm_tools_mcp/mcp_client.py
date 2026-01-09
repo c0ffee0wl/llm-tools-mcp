@@ -36,6 +36,7 @@ class McpClient:
         self._sessions: dict[str, ClientSession] = {}
         self._contexts: dict[str, object] = {}  # Transport context managers
         self._http_sessions: dict[str, object] = {}  # HTTP session objects (need aclose)
+        self._read_streams: dict[str, object] = {}  # Read streams (need aclose to avoid warnings)
         self._init_lock = threading.Lock()  # Thread-safe initialization
 
     async def _get_or_create_session(self, name: str) -> Optional[ClientSession]:
@@ -80,6 +81,7 @@ class McpClient:
                 raise ValueError(f"Unknown server config type: {type(server_config)}")
 
             self._contexts[name] = ctx
+            self._read_streams[name] = read  # Store for proper cleanup
 
             # Create and initialize session
             session = ClientSession(read, write)
@@ -211,6 +213,14 @@ class McpClient:
             except Exception:
                 pass
 
+        # Close read streams (anyio MemoryObjectReceiveStream - prevents async iterator warnings)
+        for name, read_stream in list(self._read_streams.items()):
+            try:
+                if hasattr(read_stream, 'aclose'):
+                    await read_stream.aclose()
+            except Exception:
+                pass
+
         # Close HTTP session objects (have async iterators that need aclose)
         for name, http_session in list(self._http_sessions.items()):
             try:
@@ -227,5 +237,6 @@ class McpClient:
                 pass
 
         self._sessions.clear()
+        self._read_streams.clear()
         self._http_sessions.clear()
         self._contexts.clear()
