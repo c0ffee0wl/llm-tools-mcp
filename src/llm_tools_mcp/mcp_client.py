@@ -202,14 +202,26 @@ class McpClient:
         if session is None:
             return f"Error: Failed to call tool {name} from MCP server {server_name}"
         tool_result = await session.call_tool(name, kwargs)
+
+        # Check for structuredContent first (MCP 2025-06-18 spec) - contains JSON data
+        # Some servers (like Microsoft Learn MCP) may return structured data here
+        if hasattr(tool_result, 'structuredContent') and tool_result.structuredContent:
+            import json
+            return json.dumps(tool_result.structuredContent)
+
         # Extract text from MCP content blocks (TextContent, ImageContent, etc.)
         # This ensures JSON responses are returned as actual JSON strings,
         # not Python repr of content objects like "[TextContent(type='text', text='...')]"
+        # Handle both pydantic objects (hasattr) and dicts (from JSON deserialization)
         text_parts = []
         if tool_result.content:
-            for content in tool_result.content:
-                if hasattr(content, 'text'):
-                    text_parts.append(content.text)
+            for block in tool_result.content:
+                # Handle pydantic/dataclass objects with .text attribute
+                if hasattr(block, 'text') and block.text:
+                    text_parts.append(block.text)
+                # Handle dict-style content blocks (from JSON deserialization)
+                elif isinstance(block, dict) and block.get('text'):
+                    text_parts.append(block['text'])
         return '\n'.join(text_parts) if text_parts else str(tool_result.content)
 
     async def close_all(self):
