@@ -202,7 +202,15 @@ class McpClient:
         if session is None:
             return f"Error: Failed to call tool {name} from MCP server {server_name}"
         tool_result = await session.call_tool(name, kwargs)
-        return str(tool_result.content)
+        # Extract text from MCP content blocks (TextContent, ImageContent, etc.)
+        # This ensures JSON responses are returned as actual JSON strings,
+        # not Python repr of content objects like "[TextContent(type='text', text='...')]"
+        text_parts = []
+        if tool_result.content:
+            for content in tool_result.content:
+                if hasattr(content, 'text'):
+                    text_parts.append(content.text)
+        return '\n'.join(text_parts) if text_parts else str(tool_result.content)
 
     async def close_all(self):
         """Properly cleanup all cached sessions and transports."""
