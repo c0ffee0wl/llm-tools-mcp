@@ -59,46 +59,105 @@ def _sanitize_schema(schema: dict | Any) -> dict | Any:
 
 
 # =============================================================================
-# Thread-Local Event Loop Management
+# Persistent Event Loop for MCP Operations
 # =============================================================================
-# MCP sessions and anyio cancel scopes are bound to event loops. When tool calls
-# come from different threads (e.g., daemon's thread pool executor), each thread
-# needs its own event loop to avoid cross-thread issues.
+# MCP sessions use anyio cancel scopes which are bound to TASK CONTEXTS, not
+# just event loops. Each run_until_complete() call creates a fresh task context.
+# When we reuse a session across multiple run_until_complete() calls, the cancel
+# scopes from the first call become invalid in subsequent calls.
 #
-# Strategy:
-# - _run_async_init(): Used during MCP initialization (tool discovery)
-#   Creates a temporary loop that's discarded after init
-# - _run_async(): Used for tool calls, uses thread-local loops
-#   Each thread gets its own persistent loop for session reuse within that thread
+# Solution: Keep a single event loop running continuously in a background thread
+# using run_forever(). All MCP operations are submitted via run_coroutine_threadsafe(),
+# which schedules them on the persistent loop without creating new task contexts.
 #
-# Note: This means sessions are per-thread. In the Terminator TUI case (single
-# thread), sessions are fully reused. In the daemon case (thread pool), each
-# worker thread maintains its own sessions.
+# This ensures:
+# - Sessions are created and used in compatible task contexts
+# - Cancel scopes remain valid across multiple tool calls
+# - Thread-safe access from any calling thread (main, executor, etc.)
 
-_loop_local = threading.local()  # Thread-local storage for event loops
+
+class PersistentLoopRunner:
+    """Runs an event loop in a background thread, keeping task contexts alive.
+
+    This solves the anyio cancel scope issue: since the loop runs continuously
+    (via run_forever()), all coroutines execute in compatible task contexts.
+    Sessions can be reused across multiple calls without cancel scope errors.
+    """
+
+    def __init__(self):
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._started = threading.Event()
+        self._lock = threading.Lock()
+
+    def _ensure_started(self):
+        """Start the background thread if not already running."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+
+            self._loop = asyncio.new_event_loop()
+            self._started.clear()
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                daemon=True,
+                name="mcp-event-loop"
+            )
+            self._thread.start()
+            self._started.wait()  # Wait for loop to start
+
+    def _run_loop(self):
+        """Background thread: set up and run the event loop forever."""
+        asyncio.set_event_loop(self._loop)
+        self._started.set()
+        self._loop.run_forever()
+
+    def run(self, coro):
+        """Submit a coroutine and wait for result.
+
+        Can be called from any thread. The coroutine runs on the persistent
+        loop's thread, ensuring cancel scopes remain valid.
+        """
+        self._ensure_started()
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def stop(self):
+        """Stop the event loop and join the thread."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+
+_loop_runner: Optional[PersistentLoopRunner] = None
 _mcp_client: Optional[McpClient] = None
 _cleanup_registered = False
 _cleanup_lock = threading.Lock()
 
 
-def _get_thread_loop() -> asyncio.AbstractEventLoop:
-    """Get or create a thread-local event loop."""
-    global _cleanup_registered
-    if not hasattr(_loop_local, 'loop') or _loop_local.loop is None or _loop_local.loop.is_closed():
-        _loop_local.loop = asyncio.new_event_loop()
-        # Register cleanup only once (first thread to create a loop)
+def _get_loop_runner() -> PersistentLoopRunner:
+    """Get or create the global persistent loop runner."""
+    global _loop_runner, _cleanup_registered
+    if _loop_runner is None:
         with _cleanup_lock:
-            if not _cleanup_registered:
-                atexit.register(_cleanup_loop)
-                _cleanup_registered = True
-    return _loop_local.loop
+            if _loop_runner is None:
+                _loop_runner = PersistentLoopRunner()
+                if not _cleanup_registered:
+                    atexit.register(_cleanup)
+                    _cleanup_registered = True
+    return _loop_runner
 
 
 def _run_async_init(coro):
     """Run coroutine during initialization using a temporary loop.
 
-    Used for tool discovery - creates and discards a temporary event loop
-    to avoid polluting thread-local loops with init thread ownership.
+    Used for tool discovery - creates and discards a temporary event loop.
+    Tool discovery uses ephemeral sessions, so no persistent state is created.
     """
     temp_loop = asyncio.new_event_loop()
     try:
@@ -108,34 +167,28 @@ def _run_async_init(coro):
 
 
 def _run_async(coro):
-    """Run coroutine on the thread-local loop.
+    """Run coroutine on the persistent loop.
 
-    Each thread gets its own event loop, ensuring anyio cancel scopes
-    work correctly. Sessions are reused within each thread.
+    All MCP tool calls go through here. The persistent loop keeps running
+    (via run_forever()), so task contexts and cancel scopes remain valid
+    across multiple calls. This is the key to session reuse.
     """
-    loop = _get_thread_loop()
-    return loop.run_until_complete(coro)
+    return _get_loop_runner().run(coro)
 
 
-def _cleanup_loop():
-    """Cleanup registered with atexit - closes MCP client sessions.
+def _cleanup():
+    """Cleanup registered with atexit - closes MCP sessions and stops loop."""
+    global _mcp_client, _loop_runner
 
-    With thread-local loops, we can't enumerate all loops. Instead, we close
-    the MCP client's sessions using a temporary loop. The thread-local loops
-    are cleaned up when their threads exit.
-    """
-    global _mcp_client
-    if _mcp_client:
+    if _mcp_client is not None and _loop_runner is not None:
         try:
-            # Use a temporary loop for cleanup - thread-local loops may not exist
-            # in the main thread at exit time
-            temp_loop = asyncio.new_event_loop()
-            try:
-                temp_loop.run_until_complete(_mcp_client.close_all())
-            finally:
-                temp_loop.close()
+            # Close sessions on the persistent loop (where they live)
+            _loop_runner.run(_mcp_client.close_all())
         except Exception:
             pass  # Best effort cleanup
+
+    if _loop_runner is not None:
+        _loop_runner.stop()
 
 
 # =============================================================================
