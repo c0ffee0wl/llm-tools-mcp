@@ -59,54 +59,83 @@ def _sanitize_schema(schema: dict | Any) -> dict | Any:
 
 
 # =============================================================================
-# Persistent Event Loop Management
+# Thread-Local Event Loop Management
 # =============================================================================
-# Sessions are bound to event loops - we need a persistent loop for session reuse
+# MCP sessions and anyio cancel scopes are bound to event loops. When tool calls
+# come from different threads (e.g., daemon's thread pool executor), each thread
+# needs its own event loop to avoid cross-thread issues.
+#
+# Strategy:
+# - _run_async_init(): Used during MCP initialization (tool discovery)
+#   Creates a temporary loop that's discarded after init
+# - _run_async(): Used for tool calls, uses thread-local loops
+#   Each thread gets its own persistent loop for session reuse within that thread
+#
+# Note: This means sessions are per-thread. In the Terminator TUI case (single
+# thread), sessions are fully reused. In the daemon case (thread pool), each
+# worker thread maintains its own sessions.
 
-_event_loop: Optional[asyncio.AbstractEventLoop] = None
-_loop_lock = threading.Lock()  # Thread-safe lock for loop creation
+_loop_local = threading.local()  # Thread-local storage for event loops
 _mcp_client: Optional[McpClient] = None
 _cleanup_registered = False
+_cleanup_lock = threading.Lock()
 
 
-def _get_persistent_loop() -> asyncio.AbstractEventLoop:
-    """Get or create a persistent event loop for session reuse."""
-    global _event_loop, _cleanup_registered
-    with _loop_lock:
-        if _event_loop is None or _event_loop.is_closed():
-            _event_loop = asyncio.new_event_loop()
+def _get_thread_loop() -> asyncio.AbstractEventLoop:
+    """Get or create a thread-local event loop."""
+    global _cleanup_registered
+    if not hasattr(_loop_local, 'loop') or _loop_local.loop is None or _loop_local.loop.is_closed():
+        _loop_local.loop = asyncio.new_event_loop()
+        # Register cleanup only once (first thread to create a loop)
+        with _cleanup_lock:
             if not _cleanup_registered:
                 atexit.register(_cleanup_loop)
                 _cleanup_registered = True
-        return _event_loop
+    return _loop_local.loop
+
+
+def _run_async_init(coro):
+    """Run coroutine during initialization using a temporary loop.
+
+    Used for tool discovery - creates and discards a temporary event loop
+    to avoid polluting thread-local loops with init thread ownership.
+    """
+    temp_loop = asyncio.new_event_loop()
+    try:
+        return temp_loop.run_until_complete(coro)
+    finally:
+        temp_loop.close()
 
 
 def _run_async(coro):
-    """Run coroutine on the persistent loop."""
-    loop = _get_persistent_loop()
+    """Run coroutine on the thread-local loop.
+
+    Each thread gets its own event loop, ensuring anyio cancel scopes
+    work correctly. Sessions are reused within each thread.
+    """
+    loop = _get_thread_loop()
     return loop.run_until_complete(coro)
 
 
 def _cleanup_loop():
-    """Cleanup registered with atexit - closes sessions and event loop."""
-    global _event_loop, _mcp_client
-    if _mcp_client and _event_loop and not _event_loop.is_closed():
+    """Cleanup registered with atexit - closes MCP client sessions.
+
+    With thread-local loops, we can't enumerate all loops. Instead, we close
+    the MCP client's sessions using a temporary loop. The thread-local loops
+    are cleaned up when their threads exit.
+    """
+    global _mcp_client
+    if _mcp_client:
         try:
-            _event_loop.run_until_complete(_mcp_client.close_all())
+            # Use a temporary loop for cleanup - thread-local loops may not exist
+            # in the main thread at exit time
+            temp_loop = asyncio.new_event_loop()
+            try:
+                temp_loop.run_until_complete(_mcp_client.close_all())
+            finally:
+                temp_loop.close()
         except Exception:
-            pass
-    if _event_loop and not _event_loop.is_closed():
-        try:
-            # Cancel any remaining pending tasks
-            pending = asyncio.all_tasks(_event_loop)
-            for task in pending:
-                task.cancel()
-            # Allow cancelled tasks to complete
-            if pending:
-                _event_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            _event_loop.close()
-        except Exception:
-            pass
+            pass  # Best effort cleanup
 
 
 # =============================================================================
@@ -139,10 +168,13 @@ def _create_tool_for_mcp(
 def _get_tools_for_llm(mcp_client: McpClient, mcp_config: McpConfig) -> tuple[list[llm.Tool], bool]:
     """Fetch tools from all MCP servers and convert to llm.Tool objects.
 
+    Called during initialization - uses temporary loop to avoid polluting
+    the persistent loop with background thread ownership.
+
     Returns:
         Tuple of (tools_list, had_errors) where had_errors is True if any server failed.
     """
-    tools, had_errors = _run_async(mcp_client.get_all_tools())
+    tools, had_errors = _run_async_init(mcp_client.get_all_tools())
     mapped_tools: list[llm.Tool] = []
     for server_name, server_tools in tools.items():
         for tool in server_tools:

@@ -26,31 +26,51 @@ from typing import TextIO, Optional
 class McpClient:
     """MCP client with session persistence for improved performance.
 
-    Sessions are cached per-server and reused across tool calls, eliminating
-    the 300-500ms overhead of creating a new session for each call.
+    Sessions are cached per-server per-thread and reused across tool calls,
+    eliminating the 300-500ms overhead of creating a new session for each call.
+
+    Thread-local storage is used because:
+    - MCP sessions and anyio cancel scopes are bound to event loops
+    - Each thread has its own event loop (via register_tools._get_thread_loop)
+    - Sessions created in one loop cannot be safely used from another loop
     """
 
     def __init__(self, config: McpConfig):
         self.config = config
-        # Session persistence: cache sessions and transport contexts
-        self._sessions: dict[str, ClientSession] = {}
-        self._contexts: dict[str, object] = {}  # Transport context managers
-        self._http_sessions: dict[str, object] = {}  # HTTP session objects (need aclose)
-        self._read_streams: dict[str, object] = {}  # Read streams (need aclose to avoid warnings)
+        # Thread-local session storage: each thread gets its own sessions
+        # This ensures sessions are used with the same event loop that created them
+        self._local = threading.local()
         self._init_lock = threading.Lock()  # Thread-safe initialization
+
+    def _get_thread_storage(self) -> dict:
+        """Get thread-local storage for sessions and contexts."""
+        if not hasattr(self._local, 'sessions'):
+            self._local.sessions = {}
+            self._local.contexts = {}
+            self._local.http_sessions = {}
+            self._local.read_streams = {}
+        return {
+            'sessions': self._local.sessions,
+            'contexts': self._local.contexts,
+            'http_sessions': self._local.http_sessions,
+            'read_streams': self._local.read_streams,
+        }
 
     async def _get_or_create_session(self, name: str) -> Optional[ClientSession]:
         """Get cached session or create new one with proper lifecycle."""
-        if name in self._sessions:
-            return self._sessions[name]
+        storage = self._get_thread_storage()
+        sessions = storage['sessions']
+
+        if name in sessions:
+            return sessions[name]
 
         # Double-checked locking pattern for thread safety
         with self._init_lock:
-            if name in self._sessions:
-                return self._sessions[name]
+            if name in sessions:
+                return sessions[name]
             session = await self._create_persistent_session(name)
             if session:
-                self._sessions[name] = session
+                sessions[name] = session
             return session
 
     async def _create_persistent_session(self, name: str) -> Optional[ClientSession]:
@@ -59,12 +79,14 @@ class McpClient:
         if not server_config:
             return None
 
+        storage = self._get_thread_storage()
+
         try:
             # Create transport and enter context (keep alive)
             if isinstance(server_config, HttpServerConfig):
                 ctx = streamablehttp_client(server_config.url)
                 read, write, http_session = await ctx.__aenter__()
-                self._http_sessions[name] = http_session  # Store for proper cleanup
+                storage['http_sessions'][name] = http_session  # Store for proper cleanup
             elif isinstance(server_config, SseServerConfig):
                 ctx = sse_client(server_config.url)
                 read, write = await ctx.__aenter__()
@@ -80,8 +102,8 @@ class McpClient:
             else:
                 raise ValueError(f"Unknown server config type: {type(server_config)}")
 
-            self._contexts[name] = ctx
-            self._read_streams[name] = read  # Store for proper cleanup
+            storage['contexts'][name] = ctx
+            storage['read_streams'][name] = read  # Store for proper cleanup
 
             # Create and initialize session
             session = ClientSession(read, write)
@@ -225,16 +247,27 @@ class McpClient:
         return '\n'.join(text_parts) if text_parts else str(tool_result.content)
 
     async def close_all(self):
-        """Properly cleanup all cached sessions and transports."""
+        """Properly cleanup all cached sessions and transports for calling thread.
+
+        With thread-local storage, this only cleans up the calling thread's sessions.
+        Other threads' sessions are cleaned up when those threads exit or when
+        their thread-local storage is garbage collected.
+        """
+        # Get this thread's storage (may be empty if thread never created sessions)
+        if not hasattr(self._local, 'sessions'):
+            return
+
+        storage = self._get_thread_storage()
+
         # Close sessions first (copy to list to avoid dict modification during iteration)
-        for name, session in list(self._sessions.items()):
+        for name, session in list(storage['sessions'].items()):
             try:
                 await session.__aexit__(None, None, None)
             except Exception:
                 pass
 
         # Close read streams (anyio MemoryObjectReceiveStream - prevents async iterator warnings)
-        for name, read_stream in list(self._read_streams.items()):
+        for name, read_stream in list(storage['read_streams'].items()):
             try:
                 if hasattr(read_stream, 'aclose'):
                     await read_stream.aclose()
@@ -242,7 +275,7 @@ class McpClient:
                 pass
 
         # Close HTTP session objects (have async iterators that need aclose)
-        for name, http_session in list(self._http_sessions.items()):
+        for name, http_session in list(storage['http_sessions'].items()):
             try:
                 if hasattr(http_session, 'aclose'):
                     await http_session.aclose()
@@ -250,13 +283,13 @@ class McpClient:
                 pass
 
         # Then close transport contexts
-        for name, ctx in list(self._contexts.items()):
+        for name, ctx in list(storage['contexts'].items()):
             try:
                 await ctx.__aexit__(None, None, None)
             except Exception:
                 pass
 
-        self._sessions.clear()
-        self._read_streams.clear()
-        self._http_sessions.clear()
-        self._contexts.clear()
+        storage['sessions'].clear()
+        storage['read_streams'].clear()
+        storage['http_sessions'].clear()
+        storage['contexts'].clear()
